@@ -5,87 +5,87 @@ import axios from "axios";
 const app = express();
 app.use(express.json());
 
-// Twilio will connect its WebSocket here
 let twilioWs = null;
 
-// ===============
-//  TWILIO ANSWER
-// ===============
+// =======================
+//  /answer  (TwiML)
+// =======================
 app.post("/answer", (req, res) => {
-  console.log("Twilio requested /answer");
+  console.log("Twilio hit /answer");
 
   const twiml = `
-    <Response>
-      <Start>
-        <Stream url="wss://spherereach-ws.onrender.com/stream" />
-      </Start>
-      <Say voice="Polly.Joanna">Connecting you now.</Say>
-    </Response>
-  `;
+<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <Stream url="wss://spherereach-ws.onrender.com/stream" />
+  </Connect>
+</Response>
+  `.trim();
 
-  res.type("text/xml");
+  res.set("Content-Type", "text/xml");
   res.send(twiml);
 });
 
-// OPTIONAL event handler if Twilio sends events
+// OPTIONAL: Twilio status/events
 app.post("/event", (req, res) => {
-  console.log("Twilio event received:", req.body);
+  console.log("Twilio event:", req.body);
   res.sendStatus(200);
 });
 
-// ==========================
-//  WEBSOCKET UPGRADE SERVER
-// ==========================
+// ============================
+//   WebSocket server setup
+// ============================
 const wss = new WebSocketServer({ noServer: true });
 
-const server = app.listen(process.env.PORT || 3000, () => {
-  console.log("Server running on port", process.env.PORT || 3000);
-});
+const server = app.listen(process.env.PORT || 3000, () =>
+  console.log("Server running on port", process.env.PORT || 3000)
+);
 
+// Handle WS upgrade requests
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/stream") {
-    console.log("Upgrading HTTP → WebSocket");
+    console.log("WS upgrade request for /stream");
+
     wss.handleUpgrade(req, socket, head, (ws) => {
       twilioWs = ws;
       console.log("Twilio WebSocket connected");
 
       ws.on("message", handleIncomingAudio);
-      ws.on("close", () => console.log("Twilio WebSocket closed"));
+      ws.on("close", () => console.log("Twilio WebSocket disconnected"));
     });
   }
 });
 
-// ===============================
-//  HANDLE INCOMING AUDIO FRAMES
-// ===============================
+// ============================
+//   Handle Twilio Media Frames
+// ============================
 async function handleIncomingAudio(message) {
   try {
     const data = JSON.parse(message);
 
-    // Twilio sends media frames
     if (data.event === "media") {
       const base64Audio = data.media.payload;
 
-      // Forward audio to your Lambda AI brain
+      // SEND TO YOUR LAMBDA
       const response = await axios.post(process.env.LAMBDA_URL, {
         audio: base64Audio,
       });
 
-      const audioToPlay = response.data.audio;
+      const audioToPlay = response.data?.audio;
 
       if (!audioToPlay) {
         console.log("Lambda returned no audio");
         return;
       }
 
-      // Send audio back to Twilio as a media frame
-      const outboundFrame = JSON.stringify({
+      // SEND AUDIO BACK TO TWILIO
+      const frame = JSON.stringify({
         event: "media",
         media: { payload: audioToPlay },
       });
 
       if (twilioWs?.readyState === WebSocket.OPEN) {
-        twilioWs.send(outboundFrame);
+        twilioWs.send(frame);
       }
     }
   } catch (err) {
