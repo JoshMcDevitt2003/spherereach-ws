@@ -5,18 +5,19 @@ const app = express();
 app.use(express.json());
 
 let telnyxMediaWs = null;
-let openAiWs = null;
-let openAiReady = false;
 
 // ------------------------------
 // 1. TELNYX CALL CONTROL WEBHOOK
 // ------------------------------
 app.post("/telnyx", (req, res) => {
-  const event = req.body.data;
+  const event = req.body?.data;
 
   console.log("Telnyx Event:", event?.event_type);
 
-  if (!event) return res.sendStatus(200);
+  if (!event) {
+    console.log("No event in body");
+    return res.sendStatus(200);
+  }
 
   const payload = event.payload;
   const callControlId = payload?.call_control_id;
@@ -24,12 +25,18 @@ app.post("/telnyx", (req, res) => {
   switch (event.event_type) {
     case "call.initiated":
       console.log("Incoming call");
-      return res.sendStatus(200);
+      // ANSWER CALL FIRST
+      return res.json([
+        {
+          call_control_id: callControlId,
+          command: "answer"
+        }
+      ]);
 
     case "call.answered":
-      console.log("Call answered");
+      console.log("Call answered by us");
 
-      // Tell Telnyx to start media streaming
+      // NOW START MEDIA STREAM
       return res.json([
         {
           call_control_id: callControlId,
@@ -37,9 +44,10 @@ app.post("/telnyx", (req, res) => {
           stream_url: `wss://${process.env.RENDER_EXTERNAL_HOSTNAME}/telnyx-media`
         }
       ]);
-  }
 
-  res.sendStatus(200);
+    default:
+      return res.sendStatus(200);
+  }
 });
 
 // ------------------------------
@@ -53,113 +61,20 @@ const server = app.listen(process.env.PORT || 3000, () =>
 
 server.on("upgrade", (req, socket, head) => {
   if (req.url === "/telnyx-media") {
+    console.log("Telnyx attempting WS upgrade");
+
     wss.handleUpgrade(req, socket, head, (ws) => {
-      console.log("Telnyx media WebSocket connected");
+      console.log("Telnyx media WebSocket CONNECTED");
       telnyxMediaWs = ws;
 
-      connectToOpenAi();
+      ws.on("message", (msg) => {
+        console.log("Media message received:", msg.toString().slice(0, 60));
+      });
 
-      ws.on("message", (msg) => handleTelnyxAudio(msg));
       ws.on("close", () => {
-        console.log("Telnyx media closed");
+        console.log("Telnyx media WebSocket CLOSED");
         telnyxMediaWs = null;
-        cleanupOpenAi();
       });
     });
   }
 });
-
-// ------------------------------
-// 3. SEND TELNYX AUDIO TO OPENAI
-// ------------------------------
-function handleTelnyxAudio(message) {
-  let data;
-  try {
-    data = JSON.parse(message);
-  } catch {
-    return;
-  }
-
-  const base64Audio = data?.payload?.media?.payload;
-  if (!base64Audio) return;
-
-  if (openAiReady) {
-    openAiWs.send(
-      JSON.stringify({
-        type: "input_audio_buffer.append",
-        audio: base64Audio
-      })
-    );
-  }
-}
-
-// ------------------------------
-// 4. CONNECT TO OPENAI REALTIME
-// ------------------------------
-function connectToOpenAi() {
-  const url = `wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview`;
-
-  openAiWs = new WebSocket(url, {
-    headers: {
-      Authorization: `Bearer ${process.env.OPENAI_API_KEY}`,
-      "OpenAI-Beta": "realtime=v1"
-    }
-  });
-
-  openAiWs.on("open", () => {
-    console.log("Connected to OpenAI Realtime");
-    openAiReady = true;
-
-    openAiWs.send(
-      JSON.stringify({
-        type: "session.update",
-        session: {
-          instructions: `
-Speak like a real human on the phone. Use 'uh', 'um', restarts, hesitations, imperfect grammar, short sentences, natural pauses.
-          `,
-          input_audio_format: "g711_ulaw",
-          output_audio_format: "g711_ulaw",
-          modalities: ["audio", "text"]
-        }
-      })
-    );
-
-    openAiWs.send(
-      JSON.stringify({
-        type: "response.create",
-        response: {
-          instructions: "Say hello naturally like a real person."
-        }
-      })
-    );
-  });
-
-  openAiWs.on("message", (msg) => handleOpenAiAudio(msg));
-  openAiWs.on("close", () => (openAiReady = false));
-}
-
-function cleanupOpenAi() {
-  if (openAiWs) openAiWs.close();
-  openAiReady = false;
-}
-
-// ------------------------------
-// 5. SEND OPENAI AUDIO BACK TO TELNYX
-// ------------------------------
-function handleOpenAiAudio(message) {
-  const data = JSON.parse(message);
-  if (data.type !== "response.audio.delta") return;
-
-  if (telnyxMediaWs?.readyState === WebSocket.OPEN) {
-    telnyxMediaWs.send(
-      JSON.stringify({
-        payload: {
-          type: "media",
-          media: {
-            payload: data.audio
-          }
-        }
-      })
-    );
-  }
-}
